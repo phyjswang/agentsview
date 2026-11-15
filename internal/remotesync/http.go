@@ -171,6 +171,7 @@ func (hs RemoteSync) downloadFilesIntoMirror(
 		extractLabel = "Extracting session archive from " + hs.Host
 	} else {
 		request.DeltaFiles = fetch
+		request.DeltaAppends = mirrorDeltaAppends(mirrorRoot, fetch)
 	}
 	downloadStarted := time.Now()
 	stream, err := hs.Source.Archive(ctx, request)
@@ -191,7 +192,11 @@ func (hs RemoteSync) downloadFilesIntoMirror(
 			)
 		}
 	}()
-	if err := RemoveMirrorFetchFiles(mirrorRoot, fetch); err != nil {
+	// A file offered for append keeps its mirror copy: an appended entry
+	// continues it, and a whole-file entry replaces it.
+	if err := RemoveMirrorFetchFiles(
+		mirrorRoot, filesWithoutAppends(fetch, request.DeltaAppends),
+	); err != nil {
 		return err
 	}
 	extractStarted := time.Now()
@@ -209,7 +214,17 @@ func (hs RemoteSync) downloadFilesIntoMirror(
 			ctx, mirrorRoot, selected, hs.Progress, extractLabel,
 		)
 	} else {
-		extractErr = archive.extract(ctx, mirrorRoot, hs.Progress, extractLabel)
+		var extracted map[string]struct{}
+		extracted, extractErr = archive.extractRecording(
+			ctx, mirrorRoot, hs.Progress, extractLabel,
+		)
+		if extractErr == nil {
+			// A file that vanished remotely after the manifest has no entry.
+			// Drop its kept copy, as the up-front eviction does for the rest.
+			extractErr = RemoveMirrorFetchFiles(
+				mirrorRoot, omittedAppends(request.DeltaAppends, extracted),
+			)
+		}
 	}
 	hs.logArchiveTransfer(archive, downloadDuration, extractStarted)
 	if extractErr != nil {
