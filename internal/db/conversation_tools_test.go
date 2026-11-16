@@ -142,8 +142,11 @@ func TestConversationExportToolSummaryCatchesUpAfterWalkWithoutIt(t *testing.T) 
 	assert.Empty(t, others)
 
 	// Changes that touch no tool call still page to the end of the walk.
+	started, ended := "2026-03-01T10:00:00Z", "2026-03-01T11:00:00Z"
 	for _, id := range []string{"first", "second"} {
-		require.NoError(t, d.UpsertSession(t.Context(), Session{ID: id, Project: "renamed", Machine: "local", Agent: "claude"}))
+		require.NoError(t, d.UpsertSession(t.Context(), Session{
+			ID: id, Project: "renamed", Machine: "local", Agent: "claude", StartedAt: &started, EndedAt: &ended,
+		}))
 	}
 	summaries, others, withSummaries = toolSummaryChanges(t, d,
 		ConversationExportOptions{ToolSummaries: true, Checkpoint: withSummaries, Limit: 1})
@@ -213,26 +216,134 @@ func TestConversationExportToolSummaryFollowsToolCallChanges(t *testing.T) {
 }
 
 func TestConversationExportToolSummaryIsUnavailableUnderUsagePolicy(t *testing.T) {
+	metadata := func(t *testing.T, d *DB) {
+		t.Helper()
+		started, ended := "2026-03-01T10:00:00Z", "2026-03-01T11:00:00Z"
+		require.NoError(t, d.UpsertSession(t.Context(), Session{
+			ID: "chat", Project: "sample", Machine: "local", Agent: "claude", StartedAt: &started, EndedAt: &ended,
+		}))
+	}
+	tests := []struct {
+		name string
+		// restored gives the session a change row before the policy applies.
+		restored bool
+		write    func(t *testing.T, d *DB)
+	}{
+		{"the session's messages are stored again", false, func(t *testing.T, d *DB) {
+			t.Helper()
+			require.NoError(t, d.ReplaceSessionMessages(t.Context(), "chat", []Message{
+				{SessionID: "chat", Ordinal: 0, Role: "user", Content: "Run the checks.", SourceUUID: "chat-ask"},
+				{
+					SessionID: "chat", Ordinal: 1, Role: "assistant", Content: "Running them.", SourceUUID: "chat-reply", HasToolUse: true,
+					ToolCalls: []ToolCall{{ToolName: "Bash", Category: "Bash", ToolUseID: "a"}},
+				},
+			}))
+		}},
+		{"only the session's metadata is stored again", false, metadata},
+		{"only the metadata of a once trashed session is stored again", true, metadata},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			d := testDB(t)
+			toolSession(t, d, "chat", ToolCall{ToolName: "Bash", Category: "Bash", ToolUseID: "a"})
+			if test.restored {
+				require.NoError(t, d.SoftDeleteSession(t.Context(), "chat"))
+				_, err := d.RestoreSession(t.Context(), "chat")
+				require.NoError(t, err)
+			}
+			summaries, _, checkpoint := toolSummaryChanges(t, d, ConversationExportOptions{ToolSummaries: true})
+			require.Contains(t, summaries, "chat")
+			require.NotNil(t, summaries["chat"].ToolSummary)
+
+			d.SetArchiveContent(config.ArchiveContentUsage)
+			test.write(t, d)
+
+			summaries, _, _ = toolSummaryChanges(t, d, ConversationExportOptions{ToolSummaries: true, Checkpoint: checkpoint})
+			require.Contains(t, summaries, "chat")
+			assert.Equal(t, "archive_content_excluded", summaries["chat"].Gap)
+			assert.Nil(t, summaries["chat"].ToolSummary, "calls the policy excludes are not a count of zero")
+		})
+	}
+}
+
+func TestConversationExportToolSummaryFollowsMeasuredTime(t *testing.T) {
 	d := testDB(t)
-	toolSession(t, d, "chat", ToolCall{ToolName: "Bash", Category: "Bash", ToolUseID: "a"})
+	toolSession(t, d, "chat",
+		timedCall("Bash", "a", "2026-03-01T10:00:10Z", "2026-03-01T10:01:10Z"),
+		ToolCall{ToolName: "Task", Category: "Task", ToolUseID: "t", SubagentSessionID: "helper"})
+	// A second session delegates to the same subagent session.
+	toolSession(t, d, "other", ToolCall{ToolName: "Task", Category: "Task", ToolUseID: "o", SubagentSessionID: "helper"})
 	summaries, _, checkpoint := toolSummaryChanges(t, d, ConversationExportOptions{ToolSummaries: true})
 	require.Contains(t, summaries, "chat")
-	require.NotNil(t, summaries["chat"].ToolSummary)
+	require.Equal(t, []ConversationToolCategory{
+		{Category: "Bash", Calls: 1, Timed: 1, DurationMs: 60_000},
+		{Category: "Task", Calls: 1},
+	}, summaries["chat"].ToolSummary.Categories)
 
-	// The next write under the usage policy stores the session without its calls.
-	d.SetArchiveContent(config.ArchiveContentUsage)
-	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "chat", []Message{
-		{SessionID: "chat", Ordinal: 0, Role: "user", Content: "Run the checks.", SourceUUID: "chat-ask"},
-		{
-			SessionID: "chat", Ordinal: 1, Role: "assistant", Content: "Running them.", SourceUUID: "chat-reply", HasToolUse: true,
-			ToolCalls: []ToolCall{{ToolName: "Bash", Category: "Bash", ToolUseID: "a"}},
-		},
-	}))
+	session := func(id, started, ended string) {
+		require.NoError(t, d.UpsertSession(t.Context(), Session{
+			ID: id, Project: "sample", Machine: "local", Agent: "claude", StartedAt: &started, EndedAt: &ended,
+		}))
+	}
+	// None of these steps writes a message or a tool call of the session.
+	steps := []struct {
+		name     string
+		subagent bool
+		change   func()
+		want     []ConversationToolCategory
+	}{
+		{"the subagent session it delegated to arrives", true, func() {
+			session("helper", "2026-03-01T10:02:00Z", "2026-03-01T10:07:00Z")
+		}, []ConversationToolCategory{
+			{Category: "Bash", Calls: 1, Timed: 1, DurationMs: 60_000},
+			{Category: "Task", Calls: 1, Timed: 1, DurationMs: 300_000},
+		}},
+		{"the subagent session runs longer", true, func() {
+			session("helper", "2026-03-01T10:02:00Z", "2026-03-01T10:12:00Z")
+		}, []ConversationToolCategory{
+			{Category: "Bash", Calls: 1, Timed: 1, DurationMs: 60_000},
+			{Category: "Task", Calls: 1, Timed: 1, DurationMs: 600_000},
+		}},
+		{"the subagent session is deleted", true, func() {
+			require.NoError(t, d.SoftDeleteSession(t.Context(), "helper"))
+			require.NoError(t, d.DeleteSession(t.Context(), "helper"))
+		}, []ConversationToolCategory{
+			{Category: "Bash", Calls: 1, Timed: 1, DurationMs: 60_000},
+			{Category: "Task", Calls: 1},
+		}},
+		{"the session's own end moves into a measured call", false, func() {
+			session("chat", "2026-03-01T10:00:00Z", "2026-03-01T10:00:40Z")
+		}, []ConversationToolCategory{
+			{Category: "Bash", Calls: 1, Timed: 1, DurationMs: 30_000},
+			{Category: "Task", Calls: 1},
+		}},
+	}
+	for _, step := range steps {
+		step.change()
+		summaries, _, checkpoint = toolSummaryChanges(t, d, ConversationExportOptions{ToolSummaries: true, Checkpoint: checkpoint, Limit: 1})
+		require.Contains(t, summaries, "chat", step.name)
+		require.NotNil(t, summaries["chat"].ToolSummary, step.name)
+		assert.Equal(t, step.want, summaries["chat"].ToolSummary.Categories, step.name)
+		assert.Equal(t, step.subagent, summaries["other"].ToolSummary != nil, "%s: every delegating session is listed", step.name)
+	}
+}
 
-	summaries, _, _ = toolSummaryChanges(t, d, ConversationExportOptions{ToolSummaries: true, Checkpoint: checkpoint})
-	require.Contains(t, summaries, "chat")
-	assert.Equal(t, "archive_content_excluded", summaries["chat"].Gap)
-	assert.Nil(t, summaries["chat"].ToolSummary, "removed calls are not a count of zero")
+func TestConversationExportToolSummaryAfterRebuildListsEverySession(t *testing.T) {
+	source := testDB(t)
+	toolSession(t, source, "one", ToolCall{ToolName: "Bash", Category: "Bash", ToolUseID: "a"})
+	_, _, _ = toolSummaryChanges(t, source, ConversationExportOptions{ToolSummaries: true})
+
+	// The rebuilt archive stores more sessions than the one it replaces, then
+	// takes over that archive's metadata.
+	rebuilt := testDB(t)
+	require.NoError(t, rebuilt.CopyArchiveIdentityFrom(t.Context(), source.Path()))
+	for _, id := range []string{"one", "two", "three"} {
+		toolSession(t, rebuilt, id, ToolCall{ToolName: "Bash", Category: "Bash", ToolUseID: "a"})
+	}
+	require.NoError(t, rebuilt.CopySessionMetadataFrom(t.Context(), source.Path()))
+
+	summaries, _, _ := toolSummaryChanges(t, rebuilt, ConversationExportOptions{ToolSummaries: true})
+	assert.Len(t, summaries, 3)
 }
 
 func TestConversationExportToolSummaryOfCopiedSession(t *testing.T) {

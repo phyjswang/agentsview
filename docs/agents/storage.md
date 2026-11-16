@@ -305,16 +305,27 @@ each session's summary last could have changed, counted by
 `conversation_tool_revision`. That counter is separate from the publication
 revision, so the journal changes no message or session revision. The summary is
 computed from `tool_calls` and session timing in the export's snapshot, so no
-write path maintains totals. Triggers journal a session when its
-`transcript_revision` or `deleted_at` changes and when a call's
-`observed_outcome` changes, and only on an active archive. Every write that
-adds, replaces or links tool calls advances the transcript revision; a new write
-path that changes a summary input without doing so needs its own journal entry.
-Do not add row triggers on `tool_calls` inserts or deletes. The first export and
-each writable open journal sessions that have no row, one revision each. An
-export position carries its own place in the journal (`tool_summary_after`,
-`tool_summary_through`), so a walk that starts asking for summaries replays the
-journal without replaying messages.
+write path maintains totals. Triggers journal a session on an active archive
+when an input of its summary changes:
+
+- its `transcript_revision`, `deleted_at`, `started_at` or `ended_at`;
+- a call's `observed_outcome`;
+- the `gap` of its `conversation_session_changes` row;
+- a subagent session it delegates to being inserted, deleted, or changing its
+  `started_at` or `ended_at`, because that session times the delegating call.
+
+Every write that adds, replaces or links tool calls advances the transcript
+revision; a new write path that changes a summary input without doing so needs
+its own journal entry. Do not add row triggers on `tool_calls` inserts or
+deletes. The subagent triggers on `sessions` read `tool_calls`, so a migration
+that rebuilds `tool_calls` must drop the `conversation_tool_*` triggers first;
+the next writable open recreates them. Each journal entry has its own revision,
+because a walk pages between revisions. The first export and each writable open
+journal sessions that have no row, one revision each. A rebuild keeps its own
+counter; `CopySessionMetadataFrom` does not copy it. An export position carries
+its own place in the journal (`tool_summary_after`, `tool_summary_through`), so
+a walk that starts asking for summaries replays the journal without replaying
+messages.
 
 Keep only digests and compact latest changes, not a body event log; bounded body
 reads take text from the archived message at the projected ordinal and reject it

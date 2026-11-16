@@ -360,14 +360,18 @@ session's complete current totals:
   zero one.
 - The top-level `duration_ms` merges overlapping calls. Category durations
   overlap each other, so they do not add up to it. Durations are measured as
-  in the session's timing view.
+  in the session's timing view, clipped to the session's recorded start and
+  end. For a session with no recorded start, that view clips to the first
+  prompt and the summary does not.
 - `skills` lists the skills the session invoked by name, sorted by name.
 - A subagent session has its own summary. Its parent's delegation call already
   spans it, so do not add a parent's totals to its subagents'.
 
-A summary is sent again when the session's transcript changes, when a call's
-result is classified, and when the session is trashed or restored. Replace the
-summary you hold; consecutive summaries can be equal. Other rules:
+A summary is sent again when the session's transcript, start or end changes,
+when a call's result is classified, when a subagent session it delegated to
+arrives, is deleted or changes its start or end, when its storage policy gap
+changes, and when the session is trashed or restored. Replace the summary you
+hold; consecutive summaries can be equal. Other rules:
 
 - A trashed session's summary has `deleted: true` and no `tool_summary`. A
   permanently deleted session has no summary change; its session change

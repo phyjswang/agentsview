@@ -77,11 +77,17 @@ func conversationToolChangesTx(ctx context.Context, tx *sql.Tx, after, through i
 	return changes, false, nil
 }
 
-// conversationToolSchemaSQL journals a session whenever its tool summary can
-// have changed. Every write that adds, replaces or links a session's tool
-// calls advances its transcript revision, so the session row covers them and
-// no row trigger slows tool call inserts or deletes. Only the classification
-// of a call's result is written later, on its own.
+// conversationToolSchemaSQL journals a session whenever an input of its tool
+// summary changes:
+//
+//   - its tool calls: every write that adds, replaces or links them advances
+//     the transcript revision, so the session row covers them and no row
+//     trigger slows tool call inserts or deletes;
+//   - the classification of a call's result, which is written later;
+//   - its start and end, which clip measured time;
+//   - the start, end and existence of a subagent session, which time the
+//     parent's delegating call;
+//   - its trash state and its usage policy gap.
 var conversationToolSchemaSQL = conversationToolTriggersSQL()
 
 func conversationToolTriggersSQL() string {
@@ -94,6 +100,22 @@ func conversationToolTriggersSQL() string {
  SELECT ` + session + `,CAST(value AS INTEGER) FROM archive_metadata WHERE key='` + conversationToolRevisionKey + `'
  ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision;`
 	}
+	// The sessions that delegate to a subagent session, one revision each so
+	// a walk can page between them. Their revisions follow the counter, so
+	// the highest one journaled is the counter's next value.
+	journalParents := func(subagent string) string {
+		const parents = `FROM tool_calls WHERE subagent_session_id=`
+		return `
+ INSERT INTO conversation_tool_changes(session_id,revision)
+ SELECT session_id,COALESCE((SELECT CAST(value AS INTEGER) FROM archive_metadata WHERE key='` + conversationToolRevisionKey + `'),0)
+  +ROW_NUMBER() OVER (ORDER BY session_id)
+ FROM (SELECT DISTINCT session_id ` + parents + subagent + `) WHERE true
+ ON CONFLICT(session_id) DO UPDATE SET revision=excluded.revision;
+ INSERT INTO archive_metadata(key,value)
+ SELECT '` + conversationToolRevisionKey + `',CAST(revision AS TEXT) FROM conversation_tool_changes
+ WHERE EXISTS(SELECT 1 ` + parents + subagent + `) ORDER BY revision DESC LIMIT 1
+ ON CONFLICT(key) DO UPDATE SET value=excluded.value;`
+	}
 	changed := func(columns ...string) string {
 		parts := make([]string, len(columns))
 		for i, column := range columns {
@@ -105,15 +127,24 @@ func conversationToolTriggersSQL() string {
 	trigger := func(name, event, when, body string) {
 		fmt.Fprintf(&sb, "DROP TRIGGER IF EXISTS %s;\nCREATE TRIGGER %s AFTER %s\nWHEN %s\nBEGIN%s\nEND;\n", name, name, event, when, body)
 	}
-	trigger("conversation_tool_session_insert", "INSERT ON sessions", active, journal("NEW.id"))
+	trigger("conversation_tool_session_insert", "INSERT ON sessions", active, journal("NEW.id")+journalParents("NEW.id"))
 	// Trashing and restoring republish the summary, as they do each message.
-	trigger("conversation_tool_session_update", "UPDATE OF transcript_revision,deleted_at ON sessions",
-		changed("transcript_revision", "deleted_at")+" AND "+active, journal("NEW.id"))
+	trigger("conversation_tool_session_update", "UPDATE OF transcript_revision,deleted_at,started_at,ended_at ON sessions",
+		changed("transcript_revision", "deleted_at", "started_at", "ended_at")+" AND "+active, journal("NEW.id"))
+	trigger("conversation_tool_subagent_timing", "UPDATE OF started_at,ended_at ON sessions",
+		changed("started_at", "ended_at")+" AND "+active, journalParents("NEW.id"))
 	trigger("conversation_tool_call_outcome", "UPDATE OF observed_outcome ON tool_calls",
 		changed("observed_outcome")+" AND "+active, journal("NEW.session_id"))
+	// The usage policy can settle a stored session without rewriting it. The
+	// session's change row is created by its first session change.
+	trigger("conversation_tool_session_gap_insert", "INSERT ON conversation_session_changes",
+		"NEW.gap!='' AND "+active, journal("NEW.session_id"))
+	trigger("conversation_tool_session_gap_update", "UPDATE OF gap ON conversation_session_changes",
+		changed("gap")+" AND "+active, journal("NEW.session_id"))
 	// A deleted session publishes its own deletion and has no summary left.
 	trigger("conversation_tool_session_delete", "DELETE ON sessions", "1", `
  DELETE FROM conversation_tool_changes WHERE session_id=OLD.id;`)
+	trigger("conversation_tool_subagent_delete", "DELETE ON sessions", active, journalParents("OLD.id"))
 	return sb.String()
 }
 
